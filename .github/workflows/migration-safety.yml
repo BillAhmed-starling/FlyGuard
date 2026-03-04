@@ -1,0 +1,139 @@
+name: Migration Safety Check
+
+on:
+  pull_request:
+    paths:
+      - 'db/migrations/**.sql'
+
+jobs:
+  migration-safety:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: safety_check
+          POSTGRES_USER: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # REQUIRED: git diff needs full history to compare with base branch
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build safety checker
+        run: mvn -f flyway-safety-checker/pom.xml package -q -DskipTests
+
+      # The pg_stat_user_tables CSV can be:
+      #   - Stored in the repo (e.g. .github/pg_stat_user_tables.csv)
+      #   - Downloaded from a prior workflow artifact
+      #   - Generated fresh each release from a read-only replica
+      #
+      # Format: standard Postgres COPY CSV with header.
+      # Required columns: relname, n_live_tup
+      # All other columns are ignored.
+      #
+      # Example generation command (run against prod read replica):
+      #   psql -c "\COPY pg_stat_user_tables TO 'pg_stat_user_tables.csv' CSV HEADER"
+      - name: Check for row counts CSV
+        id: row_counts
+        run: |
+          if [ -f ".github/pg_stat_user_tables.csv" ]; then
+            echo "path=.github/pg_stat_user_tables.csv" >> $GITHUB_OUTPUT
+          else
+            echo "path=" >> $GITHUB_OUTPUT
+            echo "No pg_stat_user_tables.csv found; proceeding without row count context."
+          fi
+
+      - name: Run migration safety check
+        id: safety_check
+        continue-on-error: true   # Always post comment even when RED
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ROW_COUNTS_ARG=""
+          if [ -n "${{ steps.row_counts.outputs.path }}" ]; then
+            ROW_COUNTS_ARG="--row-counts ${{ steps.row_counts.outputs.path }}"
+          fi
+
+          java -jar flyway-safety-checker/target/flyway-safety-checker-1.0.0.jar \
+            --migrations-dir db/migrations \
+            --jdbc-url jdbc:postgresql://localhost:5432/safety_check \
+            --jdbc-user postgres \
+            --jdbc-password postgres \
+            --base-branch origin/${{ github.base_ref }} \
+            $ROW_COUNTS_ARG \
+            --output safety-report.md
+
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Post / update PR comment
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            let reportContent;
+            try {
+              reportContent = fs.readFileSync('safety-report.md', 'utf8');
+            } catch (e) {
+              reportContent = '⚠️ Safety check report was not generated.';
+            }
+
+            const marker = '<!-- flyway-safety-checker -->';
+            const body = marker + '\n\n' + reportContent;
+
+            // Find existing bot comment to upsert
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.data.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+
+      - name: Fail if RED migrations detected
+        if: steps.safety_check.outcome == 'failure'
+        run: |
+          echo "RED migrations detected — blocking CI. See PR comment for details."
+          exit 1
+
+      - name: Upload safety report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-safety-report
+          path: safety-report.md
+          retention-days: 30
